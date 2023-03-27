@@ -1,0 +1,27 @@
+Package: ColonyRack
+Title: Analyzing mice colonyrack data.
+Version: 0.0.1
+Authors@R: 
+    person("Mohammad", "Orabe", , "orabe.mhd@gmail.com", role = c("aut", "cre"))
+Description: The aim of this package is to process data from RFID tag readers and save the intermediate results in separate files to be able to track large numbers of mice.
+License: `use_mit_license()`, `use_gpl3_license()` or friends to pick a
+    license
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.2.2
+Imports: 
+    crayon,
+    data.table,
+    dplyr,
+    ggplot2,
+    lubridate,
+    magrittr,
+    purrr,
+    readxl,
+    stringr,
+    tcltk,
+    cowplot
+Suggests: 
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr

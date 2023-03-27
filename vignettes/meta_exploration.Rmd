@@ -1,0 +1,905 @@
+---
+title: "Meta exploration"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{meta_exploration}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r warning = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(ColonyRack)
+```
+
+
+This script is aimed at discovering the better ways of analyzing ColonyRack
+data. The main idea is to use the data iteratively, processing it and saving the
+intermediate results as separate files. 
+Since the ColonyRack systems can have high variance in what is experimented
+with, how many cages there are, how they are positioned etc. it is willed
+to use metadata information about the experiment system itself.
+
+The ColonyRack package includes example of a datasets. It provides compelling use cases for the package’s functions and illustrates the RFID data format. The package includes also an example of all required metadata. The data can be found in ColonyRack/inst/
+
+There will be an illustration of the ColonyRack construction at the end of the markdown.
+
+Clean-up, set environment language to English. 
+Load the libraries and set some internal environments.
+```{r clean-up_and_libraries, results='hide'}
+rm(list = ls())
+Sys.setenv(LANG = "en")
+if (.Platform$OS.type == "windows") {
+  Sys.setlocale(locale = "English")
+}
+```
+
+
+```{r}
+# check for missing packages and install them (use only if ColonyRack is not used as a package!)
+# if (!require("pacman")) install.packages("pacman")
+# pacman::p_load(gcookbook, igraph, devtools, arcdiagram)
+```
+
+
+```{r warning=FALSE, message=FALSE}
+library(magrittr) # %>%
+library(dplyr) # filter
+library(readr) # write_csv2
+library(stringr) # str_split 
+library(readxl) # read_excel
+library(tidyr) # drop_na
+library(purrr) # map_df
+library(data.table) # fwrite
+
+# Libraries used for plotting
+library(ggplot2)
+library(lubridate) # as.duration
+library(viridis) # Color Brewer palette: scale_fill_viridis
+library(ggpubr)	 # ggarrange
+library(scales) # oob
+library(cowplot) # plot_grid
+library(grid) # grid.draw
+library(packcircles) # circleProgressiveLayout
+```
+
+```{r}
+internal <- new.env()
+internal$start <- Sys.time()
+# figures <- new.env()
+```
+
+Set the results folder using a path. A gui dialog box will appear (might be behind rstudio) if no path is passed to the function. Inside the result folder there will be folders created (if not existing) for csv and jpg.
+```{r results-folders, results='hide'}
+result_path <- paste0(getwd(), "/results")
+dirsave <- get_dirsave(result_path)
+```
+
+# Get data and do first cleaning and analysis.
+
+Get the raw data and some metadata.
+```{r rawdata}
+# lists all external demo raw dataset which is located inside the ColonyRack package in inst/extdata.
+demo_rawdata <- list.files(system.file('rawdata', package = 'ColonyRack'), full.names = TRUE)
+
+# Read the raw data. A GUI dialog box will appear (possibly behind rstudio) if no raw data
+# has been passed to the function. Note that the data here is used for demonstration purposes only.
+# You should delete the demo_rawdata parameter and run the readData() function with no arguments.
+# This way you can use a GUI where you can select your raw data file(s).
+rawData <- readData(demo_rawdata)
+coords <- get_coords(rawData)
+```
+
+Set the phases and groups.
+As of now, it is only supported to divide the day in one dark and one light 
+phase and to give lightON/lightOFF in hours.
+
+We define the time window for the dark phase: 00:00:00 - 11:59:59 and for the light phase: 12:00:00 - 23:59:59.
+**Note** We choose the dark phase as the start time of the day. Therefore, although there are 24 hours of data in a day, this data comes from two different dates.
+```{r phase-group}
+day_hours <- 0:23
+lightON <- 0
+lightOFF <- 12
+light_hours <- lightON:(lightOFF - 1)
+dark_hours <- setdiff(day_hours, light_hours)
+my_phases <- list("light" = light_hours, "dark" = dark_hours)
+
+my_groups <- list("All" = unique(rawData$IdRFID))
+```
+
+Clean the data to remove unneeded columns, add phase, group and
+format DateTime.
+Also get the lists of mice per group.
+```{r get cleanData}
+cleanData <- cleanRawData(rawData, phases = my_phases, groups = my_groups) 
+# cleanData_grouped_mice <- cleanData %>% filter(IdLabel %in% Age_group_mice$IdLabel)
+group_mice <- get_mice_per_group(cleanData, names(my_groups))
+```
+
+
+# 24-hours tours
+## Raw
+### Process
+We want to first get the 24-hours tours, with days starting with lightOFF.
+For these tours it is interesting to see and mark the overlaps of consecutive
+events. We define it as follows:
+
+* We look at each separate mouse, call it M.
+* If there is a new event with M, while an earlier event with M has not
+  finished yet, we call it a *double read*.
+* The number tells us what consecutive double read the event is.
+
+Technically, for M we go event after event, and compare the start-time of the
+current event (call it CE) with the "end"-time of last event (call it LE).
+If the start-time of CE comes **after** the "end"-time of LE,
+it is a double read.
+The "end"-time of LE is:
+
+* if LE was a double read, let LLE be the event before it:
+  $LE.end = max(LE.start + LE.duration, LLE.end)$
+* else: $LE.end = LE.start + LE.duration.$
+
+```{r dailyTourRaw}
+dailyTourRaw <- get_24hour_tour_raw(cleanData, lightOFF) %>% get_double_reads()
+```
+
+### Save
+We want to save the 24-hour-tour raw files. Before, a folder was created for all
+of them. Inside it, there will be one folder per group, each with one folder per
+mouse, with the csv-files in it - one file per day!
+***NOTE!*** the date and time are formatted with "T" and "Z".
+This can be parsed later using example given
+`parse_datetime("1979-10-14T1010", locale = locale(tz = "UTC"))`.
+If this is not wanted - use a different function than write_csv2.
+(eg write.csv2 with row.names = FALSE)
+```{r}
+dates <- c(unique(dailyTourRaw$Date))
+save_24hour_tour(dailyTourRaw, group_mice, dirsave, "raw")
+save_12hour_tour(dailyTourRaw, group_mice, dirsave, "raw", dates)
+```
+
+Save a csv with all the overlaps, and get a table with the count of double reads
+that were not produced by "2".
+```{r}
+dailyTourRaw %>%
+  arrange(IdLabel, DateTime) %>%
+  filter(DoubleRead + lead(DoubleRead) > 0) %>%
+  write_csv2(paste0(dirsave$csv, "/OverlapsColonyrackPre.csv"))
+
+
+dailyTourRaw %>%
+  arrange(IdLabel, DateTime) %>%
+  filter(DoubleRead > 0, IdLabel != "2") %>%
+  count(unitLabel, name = "DoubleRead_Count") %>%
+  write_csv2(paste0(dirsave$csv, "/OverlapsPerReader.csv"))
+```
+
+## Processed
+### Process
+
+Read the Reader-Cage-Neighborhood Metadata file and create the APSP-matrix.
+The conventions and restrictions are given in the file "my_graph.R".
+```{r}
+# lists external demo metadata for the cages
+demo_metadata_cage <- list.files(system.file('metadata_cage', package = 'ColonyRack'), full.names = TRUE) 
+
+# Read the cage neighborhood metadata. A GUI dialog box will appear (possibly behind rstudio) if no path
+# to the metadata has been passed to the function. Note that the data here is used for demonstration purposes only.
+# You should delete the demo_metadata_cage parameter and run the read_adj_list() function with no arguments.
+# This way you can use a GUI where you can select your raw data file(s).
+G <- read_adj_list(demo_metadata_cage)
+
+APSP <- get_apsp(G)
+```
+
+Set the cages and level connections.
+In this particular situation it is done like this.
+But the process depends a lot on how the metadata looks like.
+```{r}
+spaces <- G$Neighbors %>% str_split(", ") %>% unlist() %>% unique()
+spaces
+cages <- spaces %>% { .[str_detect(., "Cage")] }
+cages
+connections <- spaces %>% { .[str_detect(., "Tube")] }
+connections
+```
+
+
+Get the segments, their lengths and types.
+If there is exactly one space (cage or connection) between two readers.
+```{r}
+# This function does a lot of calculations and might take long time to execute.
+# dailyTourProcessed <- get_24hour_tour_processed(dailyTourRaw, APSP, cages, connections, coords)
+
+
+# or read it from an already analyzed data
+dailyTourProcessed = read_csv(paste0(dirsave$csv, "/tour_processed/dailyTourProcessed.csv"))
+dailyTourProcessed$Duration = as.duration(dailyTourProcessed$Duration)
+dailyTourProcessed
+```
+
+
+Read the mice age metadata file and keep it as a reference for later use then merge it with the dailyTourRaw dataframe.
+We also use the metadata which is included in the package.
+```{r}
+# lists external demo metadata which contains the mice ages.
+demo_metadata_age <- list.files(system.file('metadata_age', package = 'ColonyRack'), full.names = TRUE)
+
+# Read the mice age metadata. A GUI dialog box will appear (possibly behind rstudio) if no path to the
+# metadata has been passed to the function. Note that the data here is used for demonstration purposes only. 
+# You should delete the demo_metadata_age parameter and run the readAge() function with no arguments.
+# This way you can use a GUI where you can select your raw data file(s).
+Age <- readAge(demo_metadata_age)
+Age <- cleanAge(Age)
+
+# merge mice age with dailyTourProcessed dataframe 
+if (!'Age_in_months' %in% colnames(dailyTourProcessed)) {
+  dailyTourProcessed <- merge(dailyTourProcessed, Age, by='IdLabel')
+}
+```
+
+Group the mice according to their age. It is possible to select many mice in the same age-group. Here we randomly select one mouse per group.
+```{r}
+# select 1 mouse from each age group. Change this number of you want to have more than on mouse per age-group
+nr_mice_in_ageGroup = 1
+
+# ensures that you get the same mice each time you run the same process.
+set.seed(1) # to get the sample_n() command to return the same value, you need to first run the set.seed() command again. 
+
+# ("19231J", "18291F", "16829E", "16509C", "14827B", "10793A")
+Age_group_mice <- Age %>%
+  group_by(Age_in_months) %>%
+  sample_n(size = nr_mice_in_ageGroup, replace = F)
+```
+
+
+Now keep only these grouped mice in the dataset. We make a copy here so we can always come back to the original data.
+```{r}
+dailyTourProcessed_grouped_mice <- dailyTourProcessed %>%
+  filter(IdLabel %in% Age_group_mice$IdLabel) %>%
+  drop_na(DateTime_out)
+```
+
+
+### Save processed data
+We want to save the 24-hour-tour processed files.
+It all works the same as with the 24-hour-tour raw files.
+```{r}
+save_12hour_tour(dailyTourProcessed, group_mice, dirsave, "processed", dates)
+save_24hour_tour(dailyTourProcessed, group_mice, dirsave, "processed")
+
+# save the processed data frame as a CSV file
+dailyTourProcessed %>% fwrite(paste0(dirsave$csv, "/tour_processed/dailyTourProcessed_9days.csv"))
+```
+
+
+# Analyze data
+Analyze processed data, save the results as CSV files. Create figures and save them as PNG files. Results are saved in five sub-directories: distance, duration, speed, cage visits, spatial.
+
+## Distance
+Calculate and plot the traveled distance. Data frames are saved as CSV files and images as PNG.
+```{r}
+locomotion_distance <- get_locomotion_distance(dailyTourProcessed_grouped_mice)
+
+
+# plot and save as PNG files
+plot_locomotion_distance_phases_panel_line(data=locomotion_distance,
+                                           plot_file_name="locomotion_distance_phases_panel_line",
+                                           plot_height=7, plot_width=7, DPI = 120)
+
+plot_locomotion_distance_phases_line(data=locomotion_distance,
+                                     plot_file_name="locomotion_distance_phases_line",
+                                     plot_height=15, plot_width=10)
+
+plot_locomotion_distance_heatmap(data=locomotion_distance, 
+                                 plot_file_name="locomotion_distance_heatmap",
+                                 plot_height=3, plot_width=6, nr_xTicks=1)
+
+plot_locomotion_distance_phases_heatmap(data=locomotion_distance,
+                                        plot_file_name="locomotion_distance_phases_heatmap",
+                                        nr_xTicks=1, plot_height=7, plot_width=4)
+
+# save the dataframe as a csv file
+locomotion_distance %>% fwrite(paste0(dirsave$csv, "/analyzed/distance/locomotion_distance.csv"))
+
+```
+
+
+Create some sample data and calculate the traveled distance between cages and tubes for different length of time intervals.
+```{r}
+sample_data <- dailyTourProcessed_grouped_mice %>%
+  #filter(Day %in% c(1,2), IdLabel %in% c("16506D", "18288G")) %>% # this is for saving excuting time.
+  group_by(Day, IdLabel) %>%
+  group_modify(~{
+    head(.x, 1L)
+  })
+
+# Traveled distance in cages for 1, 5 minutes and 1 hour.
+dist.1m <- unique(sample_data$IdLabel) %>%
+  map_df(~{
+    get_dist_1m(sample_data %>% filter(IdLabel == .x)) %>%
+      mutate(IdLabel = .x, .before = 1)
+  })
+
+dist.5m <- unique(sample_data$IdLabel) %>%
+  map_df(~{
+    get_dist_5m(sample_data %>% filter(IdLabel == .x)) %>%
+      mutate(IdLabel = .x, .before = 1)
+  })
+
+dist.1h <- unique(sample_data$IdLabel) %>%
+  map_df(~{
+    get_dist_1h(sample_data  %>% filter(IdLabel == .x)) %>%
+     mutate(IdLabel = .x, .before = 1)
+  })
+
+# Traveled distance in tubes (only up and down tubes) for 1 hour.
+up.1h <- unique(sample_data$IdLabel) %>%
+  map_df(~{
+    get_up.1h(sample_data  %>% filter(IdLabel == .x)) %>%
+     mutate(IdLabel = .x, .before = 1)
+  })
+
+# save the dataframes as a csv files
+dist.1m %>% fwrite(paste0(dirsave$csv, "/analyzed/distance/dist.1.csv"))
+dist.5m %>% fwrite(paste0(dirsave$csv, "/analyzed/distance/dist.5m.csv"))
+dist.1h %>% fwrite(paste0(dirsave$csv, "/analyzed/distance/dist.1h.csv"))
+up.1h %>% fwrite(paste0(dirsave$csv, "/analyzed/distance/up.1h.csv"))
+```
+
+
+```{r}
+# Calculate traveled distance per day and hour.
+# Create a data frame that contains total distance values from different phases for each mouse.
+distance_daily <- get_distance(data = dailyTourProcessed_grouped_mice, phase=NA, method="perDay")
+
+# plot and save as PNG
+plot_distance_daily_xAxisAge(data= distance_daily, plot_file_name= "distance_daily_xAxisAge",
+                             plot_height=5, plot_width=8)
+plot_distance_daily_xAxisWeek(data= distance_daily, plot_file_name= "distance_daily_xAxisWeek",
+                              plot_height=5, plot_width=10)
+
+# save the dataframes as a csv files
+distance_daily %>% fwrite(paste0(dirsave$csv, "/analyzed/distance/distance_daily.csv"))
+
+```
+
+```{r}
+distance_hourly <- get_distance(data = dailyTourProcessed_grouped_mice, phase="dark", method="perHour")
+
+# plot and save as PNG
+plot_distance_hourly_xAxisAge(data= distance_hourly, 
+                              plot_file_name= "distance_hourly_xAxisAge",
+                              plot_height=2*4, plot_width=2*9)
+
+plot_distance_hourly_xAxisAge_miceTogether(data= distance_hourly,
+                                           plot_file_name= "distance_hourly_xAxisAge_miceTogether",
+                                           plot_height=16, plot_width=6)
+
+
+plot_distance_hourly_xAxisDay(data= distance_hourly,
+                              plot_file_name= "distance_hourly_xAxisDay",
+                              plot_height=16, plot_width=6)
+
+plot_distance_hourly_xAxisDay_smooth(data= distance_hourly,
+                                     plot_file_name= "distance_hourly_xAxisDay_smooth",
+                                     plot_height=16, plot_width=6)
+
+# save the dataframes as a csv files
+distance_hourly %>% fwrite(paste0(dirsave$csv, "/analyzed/distance/distance_hourly.csv"))
+
+
+# Do some manipulation on the `DateTime_in` column to make a stacked bar
+distance_hourly_manipulatedDate <- manipulatedDate_distance_hourly(dailyTourProcessed_grouped_mice,
+                                                                   phase = "dark")
+
+# plot and save as PNG
+plot_distance_hourly_xAxisDay_stackedBar(data= distance_hourly_manipulatedDate, plot_file_name= "distance_hourly_xAxisDay_stackedBar", plot_height=10, plot_width=16, nr_xTicks=1)
+
+# save the dataframes as a csv files
+distance_hourly_manipulatedDate %>% fwrite(paste0(dirsave$csv, "/analyzed/distance/distance_hourly_manipulatedDate.csv"))
+
+```
+
+```{r}
+# Calculate the mean distance per hour for each day.
+mean_hourlyDistance_perDay <- get_mean_hourlyDistance_perDay(distance_hourly)
+
+# plot and save as PNG
+plot_mean_hourlyDistance_perDay_xAxisDay_bar(data= mean_hourlyDistance_perDay,
+                                             plot_file_name= "mean_hourlyDistance_perDay",
+                                             plot_height=12, plot_width=4)
+# save the dataframes as a csv files
+mean_hourlyDistance_perDay %>% fwrite(paste0(dirsave$csv, "/analyzed/distance/mean_hourlyDistance_perDay.csv"))
+```
+
+
+## Stay duration
+Calculate the duration (time spent in cages)
+```{r}
+# Calculate the overlap of timespent in cages between all mice permutations
+# The function sums up all duration overlaps (time spent in same cages) between all mice of different lengths.
+duration_overlap <- get_duration_overlap(dailyTourProcessed_grouped_mice)
+
+plot_duration_overlap(data=duration_overlap, plot_file_name ="duration_overlap",
+                      time_lower_limit = 60, nr_mice_in_group = 2, plot_height = 10, plot_width=10)
+
+duration_overlap %>% fwrite(paste0(dirsave$csv,"/analyzed/duration/duration_overlap.csv"))
+
+```
+
+```{r}
+# For each mouse and day, and phase (dark and light) calculate the time spent in each cage.
+duration.total <- get_total_duration(dailyTourProcessed_grouped_mice)
+
+#' Calculate the mean, standard deviation, minimum and maximum time spent in each cage for each mouse in day and dark and light phases.
+duration.distr <- get_distribution_duration(dailyTourProcessed_grouped_mice)
+
+#' Calculate the duration entropy value in each cage.
+duration.entropy <- get_entropy_duration(dailyTourProcessed_grouped_mice)
+
+# save the dataframes as a csv files
+duration.total %>% fwrite(paste0(dirsave$csv, "/analyzed/duration/duration.total.csv"))
+duration.distr %>% fwrite(paste0(dirsave$csv, "/analyzed/duration/duration.distr.csv"))
+duration.entropy %>% fwrite(paste0(dirsave$csv, "/analyzed/duration/duration.emtropy.csv"))
+```
+
+```{r}
+# plot and save as PNG
+# Total duration
+plot_duration_heatmap_total(data=duration.total, plot_file_name="duration_heatmap_total_dark",
+                            phase="dark", plot_height=10, plot_width=6, DPI = 150, nr_xTicks = 1)
+# Mean duration in dark phase
+plot_duration_heatmap_distr(data=duration.distr,  dist_type = "mean", plot_file_name="duration_heatmap_mean_dark",
+                                  phase="dark", plot_height=10, plot_width=6, DPI = 150, nr_xTicks = 1)
+# Mean duration in light phase
+plot_duration_heatmap_distr(data=duration.distr,  dist_type = "mean", plot_file_name="duration_heatmap_mean_light",
+                                  phase="light", plot_height=10, plot_width=6, DPI = 150, nr_xTicks = 1)
+
+# Standard deviation of duration in dark phase
+plot_duration_heatmap_distr(data=duration.distr, dist_type = "sd", plot_file_name="duration_heatmap_sd_dark",
+                            phase="dark", plot_height=10, plot_width=6, DPI = 150, nr_xTicks = 1)
+
+# Duration entropy in dark phase
+plot_duration_heatmap_entropy(data=duration.entropy, plot_file_name="duration_heatmap_entropy_dark",
+                              phase="dark", plot_height=10, plot_width=6, DPI = 150, nr_xTicks = 1)
+```
+
+```{r}
+# For each mouse calculate the time spent in each cage and level (colony rack level) per day or per hour.
+duration_daily_cage_distribution <- get_duration_inCageLevel(data = dailyTourProcessed_grouped_mice,
+                                                    phase = "light", time_window_type = "perDay")
+# plot and save as PNG
+
+plot_duration_cage_distribution(data= duration_daily_cage_distribution,
+                       plot_file_name= "duration_daily_cage_distribution", 
+                       plot_height=10, plot_width=8,
+                       log_scale = F,
+                       time_window_type = "perDay")
+
+plot_cage_distribution_cutOutiers(data= duration_daily_cage_distribution,
+                                  plot_file_name= "duration_cage_distribution_cutOutliers", 
+                                  plot_height=10, plot_width=8,
+                                  time_window_type = "perDay")
+
+# save the dataframes as a csv files
+duration_daily_cage_distribution %>% fwrite(paste0(dirsave$csv, "/analyzed/duration/duration_daily_cage_distribution.csv"))
+
+###################
+duration_hourly_cage_distribution <- get_duration_inCageLevel(data = dailyTourProcessed_grouped_mice, 
+                                                     phase = "light", time_window_type = "perHour")
+
+# plot and save as PNG
+plot_duration_cage_distribution(data= duration_hourly_cage_distribution,
+                       plot_file_name= "duration_cage_distribution", 
+                       plot_height=10, plot_width=8,
+                       log_scale = T,
+                       time_window_type = "perHour")
+
+plot_cage_distribution_cutOutiers(data= duration_hourly_cage_distribution,
+                                  plot_file_name= "duration_cage_distribution_cutOutliers", 
+                                  plot_height=10, plot_width=8,
+                                  time_window_type = "perHour")
+
+# save the dataframes as a csv files
+duration_hourly_cage_distribution %>% fwrite(paste0(dirsave$csv, "/analyzed/duration/duration_hourly_cage_distribution.csv"))
+```
+
+```{r}
+# Create a data frame that contains total time spent in cages (no tubes) for each mouse and phase.
+# For each mouse calculate the time spent in each cage and level (colony rack level) per day or per hour.
+# Note that the date on the {Time} column is the {today()} date. This date is created for plotting purposes.
+duration_inCages_hourly <- get_duration_inCages(data=dailyTourProcessed, time_window_type="perHour", phase=NA)
+
+# plot and save as PNG
+plot_heatmap_duration_inCages_hourly(data=duration_inCages_hourly, plot_file_name="count_cage_visits_hourly",
+                                     phase=NA, day=5, nr_xTicks=4, plot_height=5, plot_width=20, DPI = 120)
+
+# save the dataframes as a csv files
+duration_inCages_hourly %>% fwrite(paste0(dirsave$csv, "/analyzed/duration/duration_inCages_hourly.csv"))
+
+```
+
+### Prepare some requiered data
+### Define the bedding day and feeding, drinking and resting cages 
+```{r}
+# skip the first week because we have data after 12:00:00
+# first_bedding_day = "2020-08-31"
+first_bedding_day = "2020-08-25" # just for testing
+
+# Define the bedding dat. Usually it is changed once a week on the same day and time
+bedding_days = seq.Date(as.Date(first_bedding_day), max(dailyTourProcessed$Date), 7) 
+#bedding_days = dailyTourProcessed %>% filter(Day %in% seq(1, 50, 7)) %>% select(Date) %>% unique()
+
+youngest_mouse = Age_group_mice[which.min(Age_group_mice$Age_in_months), 1:2]
+oldest_mouse = Age_group_mice[which.max(Age_group_mice$Age_in_months), 1]
+
+
+water_cages <- cages[grepl("-5", cages)]
+
+# food cages are the Z-2 in all levels
+food_cages <- cages[grepl("-2", cages)]
+
+# resting cages
+sleeping_cages <- cages[grepl("-1", cages) | grepl("-3", cages) | grepl("-4", cages) | grepl("-6", cages)]
+
+```
+
+```{r}
+# For each mouse, calculate the mean time spent in each cage category (food, water, resting cages) in each phase and cage level
+mean_duration_cageLevelCategory <- get_mean_duration_cageLevelCategory(data=dailyTourProcessed,
+                                                                       water_cages=water_cages,
+                                                                       food_cages=food_cages,
+                                                                       sleeping_cages=sleeping_cages)
+# plot and save as PNG
+plot_duration_distr_cageLevelCategory(data = mean_duration_cageLevelCategory, 
+                                      plot_file_name="mean_duration_distr_cageLevelCategory",
+                                      phase ="dark",
+                                      week = c(1,2),
+                                      log_scale=T,
+                                      plot_width = 8,
+                                      plot_height = 6)
+# save the dataframes as a csv files
+mean_duration_cageLevelCategory %>% fwrite(paste0(dirsave$csv,"/analyzed/duration/mean_duration_cageLevelCategory.csv"))
+
+```
+
+```{r}
+# absolute frequency
+## Duration histograms
+plot_duration_absoluteFreq_linearCages_hist(dailyTourProcessed_grouped_mice, log_scale=T,
+                                            plot_file_name="duration_absoluteFreq_linearCages_hist",
+                                            plot_width = 8,plot_height = 6)
+
+plot_duration_absoluteFreq_linearCages_hist_customized(dailyTourProcessed_grouped_mice, log_scale=T,
+                                                       plot_file_name="duration_absoluteFreq_linearCages_hist_customized",
+                                                       duration_length=10, binwidth=0.5, max_crossing_length=4, 
+                                                       plot_width = 8,plot_height = 6)
+
+plot_duration_absoluteFreq_AllTubes_hist(dailyTourProcessed_grouped_mice, log_scale=F,
+                                           plot_file_name="duration_absoluteFreq_AllTubes_hist",
+                                          plot_width = 8,plot_height = 6)
+
+plot_duration_absoluteFreq_upDownTube_hist(dailyTourProcessed_grouped_mice, plot_file_name="duration_absoluteFreq_hist",
+                                           duration_length=15,  plot_width = 8,plot_height = 6, binwidth = 0.2)
+
+plot_duration_absoluteFreq_LinearTube_hist_customized(dailyTourProcessed_grouped_mice,
+                                                      plot_file_name="duration_absoluteFreq_tube_hist",
+                                                      duration_length=5, binwidth=0.5, max_crossing_length=4, log_scale=F, 
+                                                      plot_width = 8,plot_height = 6)
+
+plot_duration_absoluteFreq_LinearTube_hist_customized(dailyTourProcessed_grouped_mice,
+                                                      plot_file_name="duration_absoluteFreq_tube_hist",
+                                                      duration_length=5, binwidth=0.25, max_crossing_length=4, log_scale=F,
+                                                      plot_width = 8,plot_height = 6)
+
+## Duration freqpoly
+plot_duration_absoluteFreq_freqpoly_linearCages(dailyTourProcessed_grouped_mice,
+                                                plot_file_name="duration_freqpoly_linearCage",
+                                                duration_length=10, max_crossing_length=1, log_scale=F,  plot_width = 8,plot_height = 6)
+
+plot_duration_absoluteFreq_freqpoly_tubes(dailyTourProcessed_grouped_mice, 
+                                          plot_file_name="duration_freqpoly_tubes",
+                                          max_crossing_length=1, log_scale=F,
+                                          duration_limit_linear_tubes = 5, 
+                                          duration_limit_UpDown_tubes = 15,
+                                          plot_width = 8,plot_height = 6)
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+# relative frequency
+## Duration histograms
+plot_duration_relativeFreq_LinearCages_hist_customized(dailyTourProcessed_grouped_mice,
+                                                       plot_file_name="duration_relativeFreq_LinearCages_hist",
+                                                       log_scale=F, 
+                                                       plot_width = 8,plot_height = 16, DPI = 120)
+
+plot_duration_relativeFreq_LinearCages_hist_customized(dailyTourProcessed_grouped_mice,
+                                                       plot_file_name="duration_relativeFreq_LinearCages_60s_hist",
+                                                       max_duration_length=60,log_scale=F,
+                                                       plot_width = 8,plot_height = 16, DPI = 120)
+
+plot_duration_relativeFreq_LinearCages_hist_customized(dailyTourProcessed_grouped_mice,
+                                                       plot_file_name="duration_relativeFreq_LinearCages_60s_1cross_hist",
+                                                       
+                                                       max_duration_length=60, cross_length = 1,
+                                                       log_scale=F,
+                                                       plot_width = 8,plot_height = 16, 120)
+
+
+plot_duration_relativeFreq_tubes_hist_customized(dailyTourProcessed_grouped_mice,
+                                                 plot_file_name="duration_relativeFreq_hist",
+                                                 max_duration_length=NULL, log_scale=F, 
+                                                 plot_width = 8,plot_height = 16, DPI = 120)
+
+## Duration freqpoly
+
+plot_duration_relativeFreq_freqpoly_linearCages_customized(dailyTourProcessed_grouped_mice,
+                                                     plot_file_name="duration_relativeFreq_freqpoly",
+                                                     cross_length = 1, max_duration_length = 60, log_scale=F,
+                                                     plot_width = 8,plot_height = 6,
+                                                     DPI = 120)
+
+plot_duration_relativeFreq_freqpoly_tubes_customized(dailyTourProcessed_grouped_mice,
+                                                     plot_file_name="duration_relativeFreq_freqpoly",
+                                                     max_duration_length = 60, log_scale=F, 
+                                                     plot_width = 8,plot_height = 6,
+                                                     DPI = 120)
+
+```
+
+
+
+## Speed
+Calculate the speed of each mouse
+```{r}
+# The speed is determined by dividing the traveled distance between two cages/tubs and the duration (time spent in cage).
+speed_df <- get_speed(dailyTourProcessed_grouped_mice)
+
+# plot and save as PNG
+plot_speed_distribution(data=speed_df, plot_file_name = "speed_distribution",  
+                                              phase="dark", nr_xTicks=1, plot_height=12, plot_width=7, log_scale = T)
+
+plot_speed_cage_distribution(data=speed_df, plot_file_name = "speed_cage_distribution",  
+                             phase="dark", mouseID="10793A", 
+                             nr_xTicks=1, plot_height=7, plot_width=10, log_scale = F)
+
+# save the dataframes as a csv files
+speed_df %>% fwrite(paste0(dirsave$csv,"/analyzed/speed/speed_df.csv"))
+```
+
+```{r}
+# Calculate the mean speed per day for each mouse
+daily_mean_speed <- get_daily_mean_speed(speed_df, phase="dark")
+
+# plot and save as PNG
+plot_speed_daily_xAxisDay_bar(data=daily_mean_speed, plot_file_name="daily_mean_speed", phase="dark", plot_height=12, plot_width=5)
+
+# save the dataframes as a csv files
+daily_mean_speed %>% fwrite(paste0(dirsave$csv,"/analyzed/speed/daily_mean_speed.csv"))
+```
+
+### Speed frequency histograms
+```{r}
+#### Cages ####
+
+# cages, 24h, all crossing lengths without zero
+plot_speed_frequency_hist(data=speed_df, plot_file_name="speed_frequency_hist_24h_cages_allCrossingLengthsWithoutZero",
+                          phase=NA, include_zero_crossing_length = F,
+                          crossing_length=Inf, cage_type=1, height=0, plot_height=10, plot_width=10)
+
+# cages, 24h, crossing lengths = 1
+plot_speed_frequency_hist(data=speed_df, plot_file_name="speed_frequency_hist_24h_cages_CrossingLengthOne",
+                          phase=NA, include_zero_crossing_length = F,
+                          crossing_length=1, cage_type=1, height=0, plot_height=10, plot_width=10)
+
+#### Tubes ####
+
+# horizontal tubes, 24h, all crossing lengths without zero
+plot_speed_frequency_hist(data=speed_df, plot_file_name="speed_frequency_hist_24h_horizontalTubes_allCrossingLengthsWithoutZero",
+                          phase=NA, include_zero_crossing_length = F,
+                          crossing_length=Inf, cage_type=2, height= 0, plot_height=10, plot_width=10)
+
+# horizontal tubes, 24h, all crossing lengths = 1
+plot_speed_frequency_hist(data=speed_df, plot_file_name="speed_frequency_hist_24h_horizontalTubes_CrossingLengthOne",
+                          phase=NA, include_zero_crossing_length = F,
+                          crossing_length=1, cage_type=2, height= 0, plot_height=10, plot_width=10)
+
+# tubes UP, 24h, all crossing lengths = 0
+plot_speed_frequency_hist(data=speed_df, plot_file_name="speed_frequency_hist_24h_TubesUP_CrossingLengthZero",
+                          phase=NA, include_zero_crossing_length = T,
+                          crossing_length=0, cage_type=2, height= 1, plot_height=10, plot_width=10)
+
+# tubes DOWN, 24h, all crossing lengths = 0
+plot_speed_frequency_hist(data=speed_df, plot_file_name="speed_frequency_hist_24h_TubesDOWN_CrossingLengthZero",
+                          phase=NA, include_zero_crossing_length = T,
+                          crossing_length=0, cage_type=2, height= -1, plot_height=10, plot_width=10)
+```
+
+### Speed frequency as polygon
+```{r}
+#### Cages ####
+
+# cages, 24h, crossing length = 1
+plot_speed_frequency_poly(data=speed_df, plot_file_name="speed_frequency_poly_24h_cages_CrossingLengthOne",
+                          phase=NA, crossing_length=1, cage_type=1, height=0, plot_height=6, plot_width=8)
+
+
+#### tubes ####
+
+# horizontal tubes, 24h, crossing length = 1
+plot_speed_frequency_poly(data=speed_df, plot_file_name="speed_frequency_poly_24h_horizontalTubes_CrossingLengthOne",
+                          phase=NA, crossing_length=1, cage_type=2, height=0, plot_height=6, plot_width=8)
+
+# tubes UP, 24h, crossing length = 0
+plot_speed_frequency_poly(data=speed_df, plot_file_name="speed_frequency_poly_24h_tubesUP_CrossingLengthZero",
+                          phase=NA, crossing_length=0, cage_type=2, height=1, plot_height=6, plot_width=8)
+
+# tubes DOWN, 24h, crossing length = 0
+plot_speed_frequency_poly(data=speed_df, plot_file_name="speed_frequency_poly_24h_tubesDOWN_CrossingLengthZero",
+                          phase=NA, crossing_length=0, cage_type=2, height=-1, plot_height=6, plot_width=8)
+
+```
+
+
+### Speed-Crossing
+Create locomotion summary for each crossing
+```{r}
+crossings <- sample_data %>%
+  filter(!is.na(Crossing)) %>%
+  get_crossing_summary()
+
+length_crossings <- sample_data %>%
+  filter(!is.na(Crossing)) %>%
+  get_length_crossing_summary()
+
+
+# save the data frames as a csv files
+crossings %>% fwrite(paste0(dirsave$csv,"/analyzed/spatial/crossings.csv"))
+crossings %>% fwrite(paste0(dirsave$csv,"/analyzed/spatial/length_crossings.csv"))
+```
+
+```{r}
+# crossing_distance_duration_speed
+plot_crossing_distance_duration_speed(data=length_crossings, plot_file_name="crossing_distance_duration_speed",
+                                      nr_xTicks=1, plot_height= 10, plot_width=10, DPI = 100)
+
+```
+
+
+## Cage visits
+Calculate the number of visited cages
+```{r}
+# Count the number of visited cages in time intervals
+# For each day, the length of the time interval can be specified (either per minute or hour).
+# Note that the date on the {Time} column is the {today()} date. This date is created for plotting purposes.
+# However the time on Time column is correct
+visited_cages_perHour <- count_visited_cages_per_interval(data=dailyTourProcessed_grouped_mice,
+                                                          first_bedding_day = "2020-08-25",  interval_type="hour") #"2020-08-31
+
+
+visited_cages_perMinute <- count_visited_cages_per_interval(data=dailyTourProcessed_grouped_mice,
+                                                    first_bedding_day = "2020-08-25",  interval_type="minute") #"2020-08-31
+
+# save the dataframes as a csv files
+visited_cages_perHour %>% fwrite(paste0(dirsave$csv,"/analyzed/cage_visits/visited_cages_perHour.csv"))
+visited_cages_perMinute %>% fwrite(paste0(dirsave$csv,"/analyzed/cage_visits/visited_cages_perMinute.csv"))
+```
+
+```{r}
+plot_cageVisits_after_bedding_change(data=visited_cages_perHour,
+                                     plot_file_name="cageVisits_after_bedding_change",
+                                     mouse=youngest_mouse,
+                                     week="all",
+                                     from="06:00", to="13:00",
+                                     graph_type = "smooth", span=NULL,
+                                     plot_width=6, plot_height=10)
+
+plot_cageVisits_after_bedding_change(data=visited_cages_perMinute,
+                                     plot_file_name="cageVisits_after_bedding_change",
+                                     mouse=youngest_mouse,
+                                     week="all",
+                                     from="06:00", to="13:00",
+                                     graph_type = "smooth", span=0.5,
+                                     plot_width=6, plot_height=10)
+
+plot_cageVisits_after_bedding_change(data=visited_cages_perHour,
+                                     plot_file_name="cageVisits_after_bedding_change",
+                                     mouse=youngest_mouse,
+                                     week=1,
+                                     from="06:00", to="13:00",
+                                     graph_type="line", span=0.5,
+                                     plot_width=6, plot_height=6)
+```
+
+
+```{r}
+# Calculate the transition distribution in UP/Down tubes.
+# For each day Count the number of visited tubes between cage levels (without linear connection on the same level where the height is 0)
+transition_distr <- get_transition_distr(dailyTourProcessed_grouped_mice)
+
+# Plot and save the the result as a PNG file
+plot_transition_tube_xAxisID(data = transition_distr,
+                             plot_file_name = "Transition_tube_xAxisID", 
+                             phase="dark", weeks = c(1,2),
+                             plot_width=6, plot_height=6)
+
+plot_transition_tube_xAxisWeek(data = transition_distr, plot_file_name = "Transition_tube_xAxisWeek",
+                               phase="dark", weeks =  c(1,2),
+                               plot_width=10, plot_height=6)
+
+# Save the dataframe as a csv files
+transition_distr %>% fwrite(paste0(dirsave$csv,"/analyzed/cage_visits/transition_distr.csv"))
+```
+                               
+```{r}
+# Count the number of visited cages (no tubes) for each mouse per hour or minute
+count_cage_visits_hourly <- get_count_cage_visits(data=dailyTourProcessed_grouped_mice, time_window_type="perHour", phase=NA)
+
+plot_heatmap_count_cage_visits_hourly(data=count_cage_visits_hourly,
+                                      plot_file_name="count_cage_visits_hourly",
+                                      phase=NA, day=2, nr_xTicks=8, plot_height=5, plot_width=10)
+
+# save the dataframes as a csv files
+count_cage_visits_hourly %>% fwrite(paste0(dirsave$csv,"/analyzed/cage_visits/count_cage_visits_hourly.csv"))
+```
+
+
+
+## Spatial
+Calculate the niche overlap value for each pair of mice.
+Spatial overlap (Pianka’s index) is a measure of the degree of spatial overlap between the different individuals. To obtain Pianka’s symmetrical index of niche overlap (Pianka 1973). the overlap for each mouse with each of the other mice was calculated. The maximum value of the index is 1 and indicates complete overlap, while the minimum value 0 indicates no overlap.
+
+```{r}
+# Niche overlap (pianka's index)
+pairwise_niche_overlap_duration <- get_pairwise_niche_overlap(dailyTourProcessed_grouped_mice, method = "duration")
+pairwise_niche_overlap_cage_visits <- get_pairwise_niche_overlap(dailyTourProcessed_grouped_mice, method = "cage_visits")
+
+
+
+plot_pairwise_niche_overlap(data= pairwise_niche_overlap_duration,
+                            plot_file_name = "pairwise_niche_overlap_duration",
+                            subtitle = "Based on duration (time spent in cages)",
+                            plot_height=6, plot_width=8)
+
+plot_pairwise_niche_overlap(data= pairwise_niche_overlap_cage_visits,
+                            plot_file_name = "pairwise_niche_overlap_duration",
+                            subtitle = "Based on cage visits (number of visited cages)",
+                            plot_height=6, plot_width=8)
+
+# save the dataframes as a csv files
+pairwise_niche_overlap_duration %>% fwrite(paste0(dirsave$csv,"/analyzed/spatial/pairwise_niche_overlap_duration.csv"))
+pairwise_niche_overlap_cage_visits %>% fwrite(paste0(dirsave$csv,"/analyzed/spatial/pairwise_niche_overlap_cage_visits.csv"))
+
+#################################################
+
+mean_pianka_index_duration <- get_mean_pianka_index(data= pairwise_niche_overlap_duration, mice_age = Age_group_mice)
+mean_pianka_index_cage_visits <- get_mean_pianka_index(data= pairwise_niche_overlap_cage_visits, mice_age = Age_group_mice)
+
+
+plot_mean_pianka_index(data=mean_pianka_index_duration, plot_file_name="mean_pianka_index_duration",
+                       subtitle="Based on duration (time spent in cages)", plot_height=6, plot_width=8)
+
+plot_mean_pianka_index(data=mean_pianka_index_cage_visits, plot_file_name="mean_pianka_index_cage_visits",
+                       subtitle="Based on cage visits (number of visited cages)", plot_height=6, plot_width=8, DPI = 150)
+
+# save the dataframes as a csv files
+mean_pianka_index_duration %>% fwrite(paste0(dirsave$csv,"/analyzed/spatial/mean_pianka_index_duration.csv"))
+mean_pianka_index_cage_visits %>% fwrite(paste0(dirsave$csv,"/analyzed/spatial/mean_pianka_index_cage_visits.csv"))
+
+```
+
+
+# Example of the ColonyRack construction
+```{r}
+magick::image_read(system.file("figures/colonyrack-construction.jpg", package = "ColonyRack"))
+```
+
+
